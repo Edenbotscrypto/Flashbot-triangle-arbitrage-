@@ -109,4 +109,21 @@ inline uint256_t getDy(const std::string& rpc, const std::string& pool, int i, i
     return hexToUint(res);
 }
 
+// ---------------- Factory helpers -----------------
+inline std::string getPairV2(const std::string& rpc, const std::string& factory, const std::string& tokenA, const std::string& tokenB) {
+    // getPair(address,address) => 0xe6a43905
+    std::string selector = "0xe6a43905";
+    std::string data = selector + encodeAddress(tokenA) + encodeAddress(tokenB);
+    std::string res = callContract(rpc, factory, "0x" + data);
+    return "0x" + padLeft64(strip0x(res)).substr(24); // last 40 hex chars -> address
+}
+
+inline std::string getPoolV3(const std::string& rpc, const std::string& factory, const std::string& tokenA, const std::string& tokenB, uint32_t fee) {
+    // getPool(address,address,uint24) => 0x1698ee82
+    std::string selector = "0x1698ee82";
+    std::stringstream ss; ss << selector << encodeAddress(tokenA) << encodeAddress(tokenB) << encodeUint(fee);
+    std::string res = callContract(rpc, factory, "0x" + ss.str());
+    return "0x" + padLeft64(strip0x(res)).substr(24);
+}
+
 } // namespace eth

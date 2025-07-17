@@ -59,7 +59,8 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
         uint256   amountIn,
         address[] calldata targets,
         bytes[]   calldata payloads,
-        address[] calldata tokensToApprove
+        address[] calldata tokensToApprove,
+        uint256   minProfitWei
     ) external onlyOwner {
         require(
             targets.length == payloads.length && targets.length == tokensToApprove.length,
@@ -74,7 +75,7 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
         amounts[0] = amountIn;
         modes[0]   = 0; // no debt – full repayment in same tx
 
-        bytes memory params = abi.encode(targets, payloads, tokensToApprove);
+        bytes memory params = abi.encode(targets, payloads, tokensToApprove, minProfitWei);
 
         LENDING_POOL.flashLoan(
             address(this),
@@ -97,7 +98,7 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
         address /* initiator */,
         bytes   calldata params
     ) external override nonReentrant returns (bool) {
-        (address[] memory targets, bytes[] memory payloads, address[] memory tokensToApprove) = abi.decode(params, (address[], bytes[], address[]));
+        (address[] memory targets, bytes[] memory payloads, address[] memory tokensToApprove, uint256 minProfitWei) = abi.decode(params, (address[], bytes[], address[], uint256));
 
         require(targets.length == payloads.length && targets.length == tokensToApprove.length, "BAD_DECODE");
 
@@ -120,7 +121,7 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
         uint finalAmount = IERC20(assets[0]).balanceOf(address(this));
 
         uint amountOwing = amounts[0].add(premiums[0]);
-        require(finalAmount > amountOwing, "UNPROFITABLE");
+        require(finalAmount >= amountOwing.add(minProfitWei), "UNPROFITABLE");
 
         // Repay Aave & pocket spread
         IERC20(assets[0]).safeApprove(address(LENDING_POOL), amountOwing);

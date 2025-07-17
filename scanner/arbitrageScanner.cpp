@@ -25,6 +25,7 @@
 #include "trade_logger.hpp"
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cmath>
+#include "telegram.hpp"
 
 using json = nlohmann::json;
 using namespace std::chrono_literals;
@@ -135,7 +136,9 @@ private:
                         auto opp = evaluateTriangle(t0, tokens_[j], tokens_[k], uint256_t(1'000'000) * pow(10, t0.decimals));
                         if (opp.profitWei > opp.gasCostWei) {
                             std::lock_guard<std::mutex> g(logMtx_);
-                            std::cout << "[PROFIT] " << t0.symbol << "->" << tokens_[j].symbol << "->" << tokens_[k].symbol << "->" << t0.symbol << " profitWei=" << opp.profitWei << std::endl;
+                            std::string msg = "PROFIT " + t0.symbol + "->" + tokens_[j].symbol + "->" + tokens_[k].symbol + "->" + t0.symbol + " profit=" + opp.profitWei.convert_to<std::string>();
+                            std::cout << msg << std::endl;
+                            telegram::send(msg);
 
                             submitFlashbots(opp);
                             db_.log(time(nullptr), t0.symbol+"-"+tokens_[j].symbol+"-"+tokens_[k].symbol, "", "", 0, "", opp.profitWei.convert_to<std::string>(), "");

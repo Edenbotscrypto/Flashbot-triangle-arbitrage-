@@ -36,6 +36,19 @@
 
 > The scanner prints out candidate paths; extend it to auto-send bundles to Flashbots ⛽.
 
+## Deployment to Polygon / Arbitrum
+
+1. Update `.env` with `POLYGON_RPC_URL` / `ARBITRUM_RPC_URL` and `PRIVATE_KEY`.
+2. Compile & deploy:
+   ```bash
+   npx hardhat run scripts/deploy.js --network polygon   # or arbitrum
+   ```
+
+> The same Solidity bytecode works on L2; just pass the Aave v3 addresses for the respective network.
+
+## Telegram Alerts
+Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` in `.env` and the scanner will push a message each time a profitable triangle is detected & bundle submitted.
+
 ## To Do
 - Finish on-chain price/reserve pulling in C++
 - Add gas estimator & ML profit scorer

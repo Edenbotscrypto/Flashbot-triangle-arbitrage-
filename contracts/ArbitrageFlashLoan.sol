@@ -32,40 +32,49 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
     using SafeMath  for uint256;
 
     address public immutable owner;          // bot controller wallet
-    address[3] public routers;               // DEX routers (e.g. Uni, Sushi, Curve)
+    // Routers no longer stored on-chain; provided dynamically per tx for max flexibility
 
     modifier onlyOwner() { require(msg.sender == owner, "NOT_OWNER"); _; }
 
     event ArbitrageExecuted(uint256 profit, uint256 gasPrice);
 
-    constructor(
-        ILendingPoolAddressesProvider _provider,
-        address[3] memory _routers
-    ) FlashLoanReceiverBase(_provider) public {
-        owner   = msg.sender;
-        routers = _routers;
+    constructor(ILendingPoolAddressesProvider _provider) FlashLoanReceiverBase(_provider) public {
+        owner = msg.sender;
     }
 
     /**
-     * @dev Called off-chain to kick-off a trade. All paths must form a cycle.
+     * @notice Kick-off an arbitrary sequence of swaps. The bot provides:
+     *         – loanToken: asset to borrow via flash-loan and the final asset repaid
+     *         – amountIn : quantity to borrow
+     *         – targets  : contract addresses to call sequentially (routers/pools)
+     *         – payloads : calldata for each target (must include `to = address(this)` where necessary)
+     *         – tokensToApprove: input token for each call that the contract should approve to target[i]
+     *
+     *  Requirements:
+     *  1. targets.length == payloads.length == tokensToApprove.length
+     *  2. The final call must end with loanToken balance >= amountOwing (checked in executeOperation)
      */
     function executeArb(
-        address[] calldata path1,
-        address[] calldata path2,
-        address[] calldata path3,
-        uint256        amountIn
+        address   loanToken,
+        uint256   amountIn,
+        address[] calldata targets,
+        bytes[]   calldata payloads,
+        address[] calldata tokensToApprove
     ) external onlyOwner {
-        require(path1[0] == path3[path3.length - 1], "CYCLE_MISMATCH");
+        require(
+            targets.length == payloads.length && targets.length == tokensToApprove.length,
+            "LEN_MISMATCH"
+        );
 
         address[] memory assets  = new address[](1);
         uint256[] memory amounts = new uint256[](1);
         uint256[] memory modes   = new uint256[](1);
 
-        assets[0]  = path1[0];
+        assets[0]  = loanToken;
         amounts[0] = amountIn;
-        modes[0]   = 0; // no debt — full repayment at end
+        modes[0]   = 0; // no debt – full repayment in same tx
 
-        bytes memory params = abi.encode(path1, path2, path3);
+        bytes memory params = abi.encode(targets, payloads, tokensToApprove);
 
         LENDING_POOL.flashLoan(
             address(this),
@@ -88,22 +97,27 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
         address /* initiator */,
         bytes   calldata params
     ) external override nonReentrant returns (bool) {
-        (address[] memory p1, address[] memory p2, address[] memory p3) = abi.decode(params, (address[], address[], address[]));
+        (address[] memory targets, bytes[] memory payloads, address[] memory tokensToApprove) = abi.decode(params, (address[], bytes[], address[]));
 
-        // 1️⃣ First swap
-        IERC20(assets[0]).safeApprove(routers[0], amounts[0]);
-        uint[] memory r1 = IUniswapV2Router02(routers[0]).swapExactTokensForTokens(amounts[0], 0, p1, address(this), block.timestamp);
-        uint amountAfter1 = r1[r1.length - 1];
+        require(targets.length == payloads.length && targets.length == tokensToApprove.length, "BAD_DECODE");
 
-        // 2️⃣ Second swap
-        IERC20(p2[0]).safeApprove(routers[1], amountAfter1);
-        uint[] memory r2 = IUniswapV2Router02(routers[1]).swapExactTokensForTokens(amountAfter1, 0, p2, address(this), block.timestamp);
-        uint amountAfter2 = r2[r2.length - 1];
+        // Execute each swap or arbitrary call in sequence
+        for (uint256 i = 0; i < targets.length; i++) {
+            // Approve if required (gas-optimised: approval only if allowance == 0)
+            address token = tokensToApprove[i];
+            if (token != address(0)) {
+                uint256 allowance = IERC20(token).allowance(address(this), targets[i]);
+                if (allowance == 0) {
+                    IERC20(token).safeApprove(targets[i], uint(-1));
+                }
+            }
 
-        // 3️⃣ Third swap
-        IERC20(p3[0]).safeApprove(routers[2], amountAfter2);
-        uint[] memory r3 = IUniswapV2Router02(routers[2]).swapExactTokensForTokens(amountAfter2, 0, p3, address(this), block.timestamp);
-        uint finalAmount = r3[r3.length - 1];
+            (bool success, bytes memory ret) = targets[i].call(payloads[i]);
+            require(success, string(abi.encodePacked("CALL_FAIL_", i)));
+            ret; // silence solidity-unused
+        }
+
+        uint finalAmount = IERC20(assets[0]).balanceOf(address(this));
 
         uint amountOwing = amounts[0].add(premiums[0]);
         require(finalAmount > amountOwing, "UNPROFITABLE");
@@ -118,7 +132,8 @@ contract ArbitrageFlashLoan is FlashLoanReceiverBase, ReentrancyGuard {
     }
 
     /* ========== ADMIN ========== */
-    function updateRouters(address[3] calldata _routers) external onlyOwner { routers = _routers; }
+    // Deprecated; kept for backward compatibility – does nothing
+    function updateRouters(address[3] calldata /*_routers*/) external onlyOwner {}
     function sweep(address token) external onlyOwner {
         IERC20 t = IERC20(token);
         t.safeTransfer(owner, t.balanceOf(address(this)));

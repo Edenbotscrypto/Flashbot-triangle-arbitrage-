@@ -5,7 +5,7 @@
  * - Evaluates triangular paths in parallel
  * - Emits calldata to the Solidity executor when profitable
  *
- * Build: g++ -std=c++17 arbitrageScanner.cpp -lcpr -lpthread -o scanner
+ * Build: g++ -std=c++17 arbitrageScanner.cpp -I. -lcpr -lsqlite3 -lboost_system -lpthread -o scanner
  */
 
 #include <iostream>
@@ -20,8 +20,16 @@
 #include <cpr/cpr.h>              // HTTP client
 #include <nlohmann/json.hpp>      // JSON parsing
 
+#include "eth.hpp"
+#include "flashbots.hpp"
+#include "trade_logger.hpp"
+#include <boost/multiprecision/cpp_int.hpp>
+#include <cmath>
+
 using json = nlohmann::json;
 using namespace std::chrono_literals;
+
+using boost::multiprecision::uint256_t;
 
 struct Token {
     std::string symbol;
@@ -29,10 +37,18 @@ struct Token {
     uint8_t     decimals;
 };
 
+struct Hop {
+    std::string dex;      // v2, v3, curve
+    std::string pool;     // pair/pool address
+    int       i;          // curve index (optional)
+    int       j;
+};
+
 struct Opportunity {
-    std::array<std::string, 3> pathSymbols;
-    double expectedProfitUSD;
-    double gasCostETH;
+    std::vector<Hop> hops;
+    uint256_t        profitWei;
+    uint256_t        gasCostWei;
+    uint256_t        loanSize;
 };
 
 class ArbitrageScanner {
@@ -52,6 +68,56 @@ private:
     const std::string rpcUrl_;
     std::vector<Token> tokens_;
     std::mutex logMtx_;
+    logger::TradeLogger db_{"db/trades.sqlite"};
+
+    // ------------ Utility Math ------------
+    static uint256_t getAmountOutV2(uint256_t amountIn, uint256_t reserveIn, uint256_t reserveOut) {
+        // UniswapV2 formula with 0.3% fee
+        uint256_t amountInWithFee = amountIn * 997;
+        uint256_t numerator = amountInWithFee * reserveOut;
+        uint256_t denominator = reserveIn * 1000 + amountInWithFee;
+        return numerator / denominator;
+    }
+
+    // Placeholder V3 price impact: assume 0.3% fee–only for demonstration
+    static uint256_t getAmountOutV3(uint256_t amountIn, double price, int decimalsIn, int decimalsOut) {
+        double inFloat = amountIn.convert_to<double>() / pow(10, decimalsIn);
+        double outFloat = inFloat * price * 0.997; // assume 0.3% fee
+        uint256_t outWei = static_cast<uint256_t>(outFloat * pow(10, decimalsOut));
+        return outWei;
+    }
+
+    Opportunity evaluateTriangle(const Token& t0, const Token& t1, const Token& t2, uint256_t initAmount) {
+        // Example: all hops on UniswapV2 (factory hard-coded) – extend as needed
+        const std::string pair01 = "0x0000000000000000000000000000000000000000"; // TODO compute via factory
+        const std::string pair12 = "0x0000000000000000000000000000000000000000";
+        const std::string pair20 = "0x0000000000000000000000000000000000000000";
+
+        using eth::getReservesV2;
+        auto r01 = getReservesV2(rpcUrl_, pair01);
+        auto r12 = getReservesV2(rpcUrl_, pair12);
+        auto r20 = getReservesV2(rpcUrl_, pair20);
+
+        uint256_t a1 = getAmountOutV2(initAmount, r01.reserve0, r01.reserve1);
+        uint256_t a2 = getAmountOutV2(a1, r12.reserve0, r12.reserve1);
+        uint256_t a3 = getAmountOutV2(a2, r20.reserve1, r20.reserve0);
+
+        Opportunity opp;
+        opp.loanSize = initAmount;
+        opp.profitWei = a3 > initAmount ? a3 - initAmount : 0;
+        opp.gasCostWei = 300000 * uint256_t(eth::hexToUint(eth::strip0x(eth::rpcCall(rpcUrl_, "eth_gasPrice", {}))));
+        return opp;
+    }
+
+    void submitFlashbots(const Opportunity& opp) {
+        // Build dummy calldata – placeholder
+        std::string calldata = "0x"; // TODO ABI encode executeArb
+        flashbots::SignedTx tx1{calldata};
+        flashbots::Bundle bundle{{tx1}, /*target block*/ 0, opp.profitWei.convert_to<uint64_t>()/50};
+        std::string pk = std::getenv("PRIVATE_KEY");
+        if (pk.empty()) return;
+        flashbots::sendBundle("https://relay.flashbots.net", bundle, pk);
+    }
 
     void scanOnce() {
         std::vector<std::thread> threads;
@@ -61,12 +127,21 @@ private:
         auto worker = [&]() {
             size_t i;
             while ((i = idx.fetch_add(1)) < tokens_.size()) {
-                const Token& t = tokens_[i];
-                // TODO: Fetch reserves containing token `t` via eth_call
-                // TODO: Evaluate triangular paths & estimate profit
-                // Fake demo output:
-                std::lock_guard<std::mutex> g(logMtx_);
-                std::cout << "[SCAN] token=" << t.symbol << std::endl;
+
+                // Evaluate triangles starting with token i (t0)
+                const Token& t0 = tokens_[i];
+                for (size_t j = 0; j < tokens_.size(); ++j) if (j != i) {
+                    for (size_t k = 0; k < tokens_.size(); ++k) if (k != i && k != j) {
+                        auto opp = evaluateTriangle(t0, tokens_[j], tokens_[k], uint256_t(1'000'000) * pow(10, t0.decimals));
+                        if (opp.profitWei > opp.gasCostWei) {
+                            std::lock_guard<std::mutex> g(logMtx_);
+                            std::cout << "[PROFIT] " << t0.symbol << "->" << tokens_[j].symbol << "->" << tokens_[k].symbol << "->" << t0.symbol << " profitWei=" << opp.profitWei << std::endl;
+
+                            submitFlashbots(opp);
+                            db_.log(time(nullptr), t0.symbol+"-"+tokens_[j].symbol+"-"+tokens_[k].symbol, "", "", 0, "", opp.profitWei.convert_to<std::string>(), "");
+                        }
+                    }
+                }
             }
         };
 

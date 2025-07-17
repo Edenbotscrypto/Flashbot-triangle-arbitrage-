@@ -177,6 +177,24 @@ def main():
             signed_tx = mev_signer.sign_transaction(tx)
             bundle = [signed_tx.rawTransaction]
             block = w3.eth.block_number + 1
+            sim_bundle = fb_w3.flashbots.simulate_bundle({"txs": bundle, "block_number": block})
+            print("Simulation", sim_bundle)
+
+            # Add 1% tip
+            tip_wei = int(best["net"] * 0.01)
+            coinbase_tx = {
+                "to": "0x0000000000000000000000000000000000000000",  # empty -> miner
+                "from": mev_signer.address,
+                "value": tip_wei,
+                "gas": 21000,
+                "maxFeePerGas": w3.toWei("50", "gwei"),
+                "maxPriorityFeePerGas": w3.toWei("2", "gwei"),
+                "chainId": 1,
+                "nonce": w3.eth.get_transaction_count(mev_signer.address) + 1,
+            }
+            signed_tip = mev_signer.sign_transaction(coinbase_tx)
+
+            bundle = [signed_tx.rawTransaction, signed_tip.rawTransaction]
             result = fb_w3.flashbots.send_bundle({
                 "txs": bundle,
                 "block_number": block,
@@ -184,7 +202,24 @@ def main():
                 "max_timestamp": 0,
                 "reverting_tx_hashes": []
             })
-            print("Flashbots result", result)
+            print("Bundle submitted", result)
+
+            # store to logs
+            with open("logs/trades.json", "a") as f:
+                rec = {
+                    "ts": int(time.time()),
+                    "path": best["path"],
+                    "loan": init_amount,
+                    "net": int(best["net"]),
+                    "gas": gas_est,
+                    "roi": best["roi"],
+                    "block": block,
+                    "bundleHash": result["bundleHash"] if isinstance(result, dict) else str(result)
+                }
+                f.write(json.dumps(rec) + "\n")
+
+            # 1% coinbase tip via value field
+
         time.sleep(3)
 
 
